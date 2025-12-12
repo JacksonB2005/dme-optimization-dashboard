@@ -412,9 +412,39 @@ def run_model(
         if pulp.value(w[(z, k, t0)]) and pulp.value(w[(z, k, t0)]) > 1e-6
     ])
 
-    return {
+    # ---- Cost breakdown ----
+    cost_ZR = sum(
+        cost_mult_ZR * C_ZR.get((z, r), 0.0) * gamma[k] * pulp.value(x[(z, r, k, t)])
+        for z in Z for r in R for k in K for t in T
+        if pulp.value(x[(z, r, k, t)]) is not None
+    )
+
+    cost_RW = sum(
+        cost_mult_RW * C_RW.get(r, 0.0) * gamma[k] * pulp.value(y[(r, k, t)])
+        for r in R for k in K for t in T
+        if pulp.value(y[(r, k, t)]) is not None
+    )
+
+    cost_WZ = sum(
+        cost_mult_WZ * C_WZ.get(z, 0.0) * gamma[k] * pulp.value(w[(z, k, t)])
+        for z in Z for k in K for t in T
+        if pulp.value(w[(z, k, t)]) is not None
+    )
+
+    cost_breakdown = {
+        "Zone_to_Refurb": float(cost_ZR),
+        "Refurb_to_Warehouse": float(cost_RW),
+        "Warehouse_to_Zone": float(cost_WZ),
+        "Total": float(cost_ZR + cost_RW + cost_WZ),
+    }
+
+
+
+
+       return {
         "status": status_str,
         "objective": obj_value,
+        "cost_breakdown": cost_breakdown,
         "flows_ZR": flows_ZR,
         "flows_RW": flows_RW,
         "flows_WZ": flows_WZ,
