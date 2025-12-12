@@ -1,97 +1,88 @@
+from __future__ import annotations
+
 from pathlib import Path
 import pandas as pd
 
-# -------------------------------------------------
-# Resolve path to the Excel file (robust for cloud)
-# -------------------------------------------------
-HERE = Path(__file__).resolve().parent
-EXCEL_FILE = HERE / "Operations Final X.xlsx"
 
-
-def load_data(
-    excel_file=EXCEL_FILE,
-    stage_levels: dict | None = None,
-    cap_multiplier: float = 1.0
-):
+def _find_excel_file(filename: str = "Operations Final X.xlsx") -> Path:
     """
-    Load cleaned Excel sheets and return all sets + parameters
-    required by the optimization model.
-
-    Works both locally and on Streamlit Cloud.
+    Look for the Excel file in common deploy locations:
+    - same folder as this file (dme_dashboard/)
+    - repo root
+    - current working directory
     """
+    app_dir = Path(__file__).resolve().parent          # .../dme_dashboard
+    repo_dir = app_dir.parent                         # repo root
+    candidates = [
+        app_dir / filename,
+        repo_dir / filename,
+        Path.cwd() / filename,
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
 
-    excel_file = Path(excel_file)
+    raise FileNotFoundError(
+        "Excel file not found. Tried:\n" + "\n".join(f" - {c}" for c in candidates)
+    )
 
-    # ---- Safety check ----
-    if not excel_file.exists():
-        available = [p.name for p in HERE.glob("*.xlsx")]
-        raise FileNotFoundError(
-            f"\nExcel file not found.\n"
-            f"Expected: {excel_file}\n"
-            f"Directory: {HERE}\n"
-            f"Excel files found: {available}\n"
+
+def _sheet_map(excel_path: Path) -> dict[str, str]:
+    """
+    Build a case-insensitive map of sheet names -> actual sheet name.
+    """
+    xl = pd.ExcelFile(excel_path, engine="openpyxl")
+    return {name.strip().lower(): name for name in xl.sheet_names}
+
+
+def _read_sheet(excel_path: Path, sheet_name: str) -> pd.DataFrame:
+    """
+    Read a sheet by exact name, with fallback to case-insensitive match.
+    """
+    smap = _sheet_map(excel_path)
+    key = sheet_name.strip().lower()
+    actual = smap.get(key)
+
+    if actual is None:
+        available = sorted(smap.values())
+        raise ValueError(
+            f"Worksheet named '{sheet_name}' not found.\n"
+            f"Available sheets: {available}"
         )
 
-    # -------------------------------------------------
-    # Load sheets
-    # -------------------------------------------------
-    supply_df = pd.read_excel(excel_file, sheet_name="SupplyClean")
-    demand_df = pd.read_excel(excel_file, sheet_name="DemandClean")
-    cost_df = pd.read_excel(excel_file, sheet_name="CostsClean")
-    capacity_df = pd.read_excel(excel_file, sheet_name="CapacitiesClean")
+    return pd.read_excel(excel_path, sheet_name=actual, engine="openpyxl")
 
-    # -------------------------------------------------
-    # Normalize column names
-    # -------------------------------------------------
-    for df in [supply_df, demand_df, cost_df, capacity_df]:
-        df.columns = [c.strip() for c in df.columns]
 
-    # -------------------------------------------------
-    # Build sets
-    # -------------------------------------------------
-    Z = supply_df["Zone"].unique().tolist()
-    R = cost_df["Refurb"].unique().tolist()
-    W = cost_df["Warehouse"].unique().tolist()
-    K = capacity_df["Lane"].unique().tolist()
+def load_data(excel_file: str | Path | None = None) -> dict[str, pd.DataFrame]:
+    """
+    Load cleaned Excel sheets exactly as they exist in the workbook.
+    """
+    excel_path = Path(excel_file) if excel_file is not None else _find_excel_file()
 
-    # -------------------------------------------------
-    # Parameters
-    # -------------------------------------------------
-    supply = dict(zip(supply_df["Zone"], supply_df["Supply"]))
-    demand = dict(zip(demand_df["Zone"], demand_df["Demand"]))
+    supply_df = _read_sheet(excel_path, "SupplyClean")
+    demand_df = _read_sheet(excel_path, "DemandClean")
 
-    cost_ZR = {
-        (row["Zone"], row["Refurb"]): row["Cost"]
-        for _, row in cost_df[cost_df["Type"] == "ZR"].iterrows()
-    }
+    # Distance matrices
+    dist_zr = _read_sheet(excel_path, "DistClean_ZR")
+    dist_rw = _read_sheet(excel_path, "DistClean_RW")
+    dist_wz = _read_sheet(excel_path, "DistClean_WZ")
 
-    cost_RW = {
-        (row["Refurb"], row["Warehouse"]): row["Cost"]
-        for _, row in cost_df[cost_df["Type"] == "RW"].iterrows()
-    }
+    # Lane capacities (NOTE: your workbook tab shows LaneCap_Wz)
+    cap_zr = _read_sheet(excel_path, "LaneCap_ZR")
+    cap_wz = _read_sheet(excel_path, "LaneCap_Wz")
 
-    cost_WZ = {
-        (row["Warehouse"], row["Zone"]): row["Cost"]
-        for _, row in cost_df[cost_df["Type"] == "WZ"].iterrows()
-    }
+    # Other parameters
+    traffic_df = _read_sheet(excel_path, "TrafficRatesClean")
+    gamma_df = _read_sheet(excel_path, "GammaClean")
 
-    capacity = {
-        row["Lane"]: row["Capacity"] * cap_multiplier
-        for _, row in capacity_df.iterrows()
-    }
-
-    # -------------------------------------------------
-    # Return everything as a dict
-    # -------------------------------------------------
     return {
-        "Z": Z,
-        "R": R,
-        "W": W,
-        "K": K,
-        "supply": supply,
-        "demand": demand,
-        "cost_ZR": cost_ZR,
-        "cost_RW": cost_RW,
-        "cost_WZ": cost_WZ,
-        "capacity": capacity,
+        "supply": supply_df,
+        "demand": demand_df,
+        "dist_ZR": dist_zr,
+        "dist_RW": dist_rw,
+        "dist_WZ": dist_wz,
+        "cap_ZR": cap_zr,
+        "cap_WZ": cap_wz,
+        "traffic": traffic_df,
+        "gamma": gamma_df,
     }
