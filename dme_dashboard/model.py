@@ -3,13 +3,16 @@ import pandas as pd
 from data_loader import load_data
 
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def _norm(s: str) -> str:
-    return "".join(ch.lower() for ch in str(s).strip() if ch.isalnum())
+    return str(s).strip().lower().replace(" ", "").replace("-", "_")
 
 
-def _pick_col(df: pd.DataFrame, candidates):
+def _col(df: pd.DataFrame, candidates):
     """
-    Try to find a column by name (flexible). If not found, return None.
+    Find a column in df whose normalized name matches any candidate (also normalized).
     """
     cols = list(df.columns)
     norm_map = {_norm(c): c for c in cols}
@@ -20,184 +23,290 @@ def _pick_col(df: pd.DataFrame, candidates):
     return None
 
 
-def _as_3col(df: pd.DataFrame):
+def _to_float(x):
+    try:
+        if pd.isna(x):
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _traffic_multiplier_map(traffic_df: pd.DataFrame) -> dict:
     """
-    Return (colA, colB, colV) using best-effort detection,
-    else fallback to first/second/third column.
+    Build Level -> multiplier map from TrafficRatesClean if possible.
+    If not possible, return defaults.
     """
-    if df.shape[1] < 2:
-        raise ValueError(f"Expected at least 2 columns, got {df.shape[1]} in {list(df.columns)}")
+    if traffic_df is None or traffic_df.empty:
+        return {"low": 1.0, "med": 1.0, "medium": 1.0, "high": 1.0}
 
-    # try common patterns
-    a = _pick_col(df, ["zone", "from", "origin", "i", "start"])
-    b = _pick_col(df, ["refurb", "warehouse", "to", "dest", "destination", "j", "end"])
-    v = _pick_col(df, ["dist", "distance", "miles", "cost", "value", "rate", "cap", "capacity"])
+    lvl_col = _col(traffic_df, ["level", "service_level", "tier"])
+    val_col = _col(traffic_df, ["multiplier", "rate", "traffic_rate", "factor"])
 
-    cols = list(df.columns)
+    if not lvl_col or not val_col:
+        return {"low": 1.0, "med": 1.0, "medium": 1.0, "high": 1.0}
 
-    if a is None:
-        a = cols[0]
-    if b is None:
-        b = cols[1]
-    if v is None:
-        v = cols[2] if len(cols) >= 3 else None
+    m = {}
+    for _, r in traffic_df[[lvl_col, val_col]].dropna().iterrows():
+        lvl = _norm(r[lvl_col])
+        val = _to_float(r[val_col])
+        if val is not None:
+            m[lvl] = val
 
-    return a, b, v
+    # sensible fallbacks
+    if "med" not in m and "medium" in m:
+        m["med"] = m["medium"]
+    for k in ["low", "med", "medium", "high"]:
+        m.setdefault(k, 1.0)
+
+    return m
 
 
-def _supply_demand_to_long(df: pd.DataFrame, value_name: str):
+def _gamma_map(gamma_df: pd.DataFrame, K: list) -> dict:
     """
-    Accepts either:
-    - long format: Zone, Type, Supply/Demand
-    - wide format: Zone then types as columns
-    Returns a dataframe with columns: Zone, Type, Value
+    Build type -> gamma map. If sheet missing or columns unclear, default gamma=1 for all K.
     """
-    zone_col = _pick_col(df, ["zone", "z"])
-    type_col = _pick_col(df, ["type", "k", "item", "category"])
-    val_col  = _pick_col(df, [value_name, "value", "qty", "quantity", "amount"])
+    if gamma_df is None or gamma_df.empty:
+        return {k: 1.0 for k in K}
 
-    if zone_col and type_col and val_col:
-        out = df[[zone_col, type_col, val_col]].copy()
-        out.columns = ["Zone", "Type", "Value"]
-        return out
+    type_col = _col(gamma_df, ["type", "category", "k"])
+    gam_col = _col(gamma_df, ["gamma", "weight", "multiplier", "factor"])
 
-    # wide fallback: assume first col is Zone, remaining are types
-    cols = list(df.columns)
-    zone_col = cols[0]
-    melted = df.melt(id_vars=[zone_col], var_name="Type", value_name="Value")
-    melted.rename(columns={zone_col: "Zone"}, inplace=True)
-    return melted
+    if not type_col or not gam_col:
+        return {k: 1.0 for k in K}
 
+    g = {}
+    for _, r in gamma_df[[type_col, gam_col]].dropna().iterrows():
+        t = str(r[type_col]).strip()
+        v = _to_float(r[gam_col])
+        if v is not None:
+            g[t] = v
 
-def _gamma_to_dict(df: pd.DataFrame, K):
-    # Try (Type, Gamma) long format
-    type_col = _pick_col(df, ["type", "k", "item"])
-    gam_col  = _pick_col(df, ["gamma", "weight", "multiplier", "factor", "value"])
-    if type_col and gam_col:
-        d = {}
-        for _, r in df[[type_col, gam_col]].dropna().iterrows():
-            d[str(r[type_col])] = float(r[gam_col])
-        # fill missing with 1.0
-        return {k: float(d.get(k, 1.0)) for k in K}
-    # fallback: all 1
-    return {k: 1.0 for k in K}
+    return {k: float(g.get(k, 1.0)) for k in K}
 
 
-def _traffic_to_dict(df: pd.DataFrame):
+# -----------------------------
+# Main optimization model
+# -----------------------------
+def run_model(
+    cost_mult_ZR=1.0,
+    cost_mult_RW=1.0,
+    cost_mult_WZ=1.0,
+    cap_mult=1.0,
+):
     """
-    If traffic sheet has a time column, use it.
-    Otherwise return one period with multiplier 1.0 (or the single value if present).
+    Solve DME network LP.
+    Uses these sheets (exactly like your workbook tabs):
+      - SupplyClean, DemandClean
+      - DistClean_ZR, DistClean_RW, DistClean_WZ
+      - LaneCap_ZR, LaneCap_Wz
+      - TrafficRatesClean, GammaClean
     """
-    t_col = _pick_col(df, ["t", "time", "period", "week"])
-    v_col = _pick_col(df, ["traffic", "rate", "multiplier", "factor", "value"])
 
-    if t_col and v_col:
-        out = {}
-        for _, r in df[[t_col, v_col]].dropna().iterrows():
-            out[str(r[t_col])] = float(r[v_col])
-        return out
-
-    # if single numeric value exists anywhere, use it
-    for c in df.columns:
-        try:
-            val = float(df[c].dropna().iloc[0])
-            return {"T1": val}
-        except Exception:
-            continue
-
-    return {"T1": 1.0}
-
-
-def run_model(cost_mult_ZR=1.0, cost_mult_RW=1.0, cost_mult_WZ=1.0, cap_mult=1.0):
     data = load_data()
 
-    supply_df = data["supply"]
-    demand_df = data["demand"]
-    dist_zr_df = data["dist_ZR"]
-    dist_rw_df = data["dist_RW"]
-    dist_wz_df = data["dist_WZ"]
-    cap_zr_df = data["cap_ZR"]
-    cap_wz_df = data["cap_WZ"]
-    traffic_df = data["traffic"]
-    gamma_df = data["gamma"]
+    supply_df = data["supply"].copy()
+    demand_df = data["demand"].copy()
+    dist_zr_df = data["dist_ZR"].copy()
+    dist_rw_df = data["dist_RW"].copy()
+    dist_wz_df = data["dist_WZ"].copy()
+    cap_zr_df = data["cap_ZR"].copy()
+    cap_wz_df = data["cap_WZ"].copy()
+    traffic_df = data.get("traffic", pd.DataFrame()).copy()
+    gamma_df = data.get("gamma", pd.DataFrame()).copy()
 
-    supply_long = _supply_demand_to_long(supply_df, "supply")
-    demand_long = _supply_demand_to_long(demand_df, "demand")
+    # ---- Build sets Z, K ----
+    zone_col_s = _col(supply_df, ["zone"])
+    zone_col_d = _col(demand_df, ["zone"])
+    if not zone_col_s or not zone_col_d:
+        raise ValueError(f"Supply/Demand must have a 'Zone' column. "
+                         f"Supply cols={list(supply_df.columns)} Demand cols={list(demand_df.columns)}")
 
-    # sets
-    Z = sorted(set(supply_long["Zone"].astype(str)) | set(demand_long["Zone"].astype(str)))
-    K = sorted(set(supply_long["Type"].astype(str)) | set(demand_long["Type"].astype(str)))
-    traffic = _traffic_to_dict(traffic_df)
-    T = sorted(traffic.keys())
+    supply_df[zone_col_s] = supply_df[zone_col_s].astype(str).str.strip()
+    demand_df[zone_col_d] = demand_df[zone_col_d].astype(str).str.strip()
 
-    gamma = _gamma_to_dict(gamma_df, K)
+    Z = sorted(set(supply_df[zone_col_s]).intersection(set(demand_df[zone_col_d])))
 
-    # supply/demand dicts
-    supply = {(z, k): 0.0 for z in Z for k in K}
-    for _, r in supply_long.dropna().iterrows():
-        z = str(r["Zone"]); k = str(r["Type"])
-        try:
-            supply[(z, k)] = float(r["Value"])
-        except Exception:
-            pass
+    # Assume "types" are all columns except Zone
+    K = [c for c in supply_df.columns if c != zone_col_s]
+    if len(K) == 0:
+        # fallback: single commodity
+        K = ["All"]
 
-    demand = {(z, k): 0.0 for z in Z for k in K}
-    for _, r in demand_long.dropna().iterrows():
-        z = str(r["Zone"]); k = str(r["Type"])
-        try:
-            demand[(z, k)] = float(r["Value"])
-        except Exception:
-            pass
-
-    # costs / distances
-    a, b, v = _as_3col(dist_zr_df)
-    if v is None:
-        raise ValueError(f"DistClean_ZR needs a value column. Columns={list(dist_zr_df.columns)}")
-    C_ZR = {(str(r[a]), str(r[b])): float(r[v]) for _, r in dist_zr_df[[a, b, v]].dropna().iterrows()}
-
-    a, b, v = _as_3col(dist_rw_df)
-    if v is None:
-        raise ValueError(f"DistClean_RW needs a value column. Columns={list(dist_rw_df.columns)}")
-    # RW might be keyed by refurb only; handle both 2-col and 3-col cases
-    if dist_rw_df.shape[1] >= 3:
-        C_RW = {str(r[a]): float(r[v]) for _, r in dist_rw_df[[a, v]].dropna().iterrows()}
+    # ---- Refurb set R ----
+    # From DistClean_RW or DistClean_ZR columns
+    r_col_rw = _col(dist_rw_df, ["refurb", "refurbcenter", "r"])
+    if r_col_rw:
+        R = sorted(dist_rw_df[r_col_rw].dropna().astype(str).str.strip().unique().tolist())
     else:
-        # fallback: first col refurb, second col value
-        cols = list(dist_rw_df.columns)
-        C_RW = {str(r[cols[0]]): float(r[cols[1]]) for _, r in dist_rw_df[[cols[0], cols[1]]].dropna().iterrows()}
+        # fallback: parse R? columns like R1_Dist, R2_Dist
+        R = []
+        for c in dist_zr_df.columns:
+            n = _norm(c)
+            if n.endswith("_dist") and n.startswith("r"):
+                R.append(c.split("_")[0].strip())
+        R = sorted(set(R))
 
-    a, b, v = _as_3col(dist_wz_df)
-    if v is None:
-        raise ValueError(f"DistClean_WZ needs a value column. Columns={list(dist_wz_df.columns)}")
-    # WZ might be keyed by zone only
-    if dist_wz_df.shape[1] >= 3:
-        C_WZ = {str(r[b]): float(r[v]) for _, r in dist_wz_df[[b, v]].dropna().iterrows()}
-    else:
-        cols = list(dist_wz_df.columns)
-        C_WZ = {str(r[cols[0]]): float(r[cols[1]]) for _, r in dist_wz_df[[cols[0], cols[1]]].dropna().iterrows()}
+    if not R:
+        raise ValueError(f"Could not infer refurb centers R from DistClean_RW or DistClean_ZR. "
+                         f"DistClean_RW cols={list(dist_rw_df.columns)}, DistClean_ZR cols={list(dist_zr_df.columns)}")
 
-    # lane capacities
-    a, b, v = _as_3col(cap_zr_df)
-    if v is None:
-        # if only two cols, treat as (a,b)=(zone,refurb) and v=second?? but cap must exist
-        cols = list(cap_zr_df.columns)
-        if len(cols) >= 3:
-            v = cols[2]
-        else:
-            raise ValueError(f"LaneCap_ZR needs a capacity column. Columns={list(cap_zr_df.columns)}")
-    lane_cap_ZR = {(str(r[a]), str(r[b])): float(r[v]) for _, r in cap_zr_df[[a, b, v]].dropna().iterrows()}
+    # ---- Time periods ----
+    T = ["T1"]  # single-period model (matches your original approach)
 
-    # WZ cap: assume (zone, cap) even if sheet has extra cols
-    cols = list(cap_wz_df.columns)
-    zc = _pick_col(cap_wz_df, ["zone", "z"]) or cols[0]
-    vc = _pick_col(cap_wz_df, ["cap", "capacity", "value"]) or (cols[1] if len(cols) > 1 else cols[0])
-    lane_cap_WZ = {str(r[zc]): float(r[vc]) for _, r in cap_wz_df[[zc, vc]].dropna().iterrows()}
+    # ---- Build parameter maps ----
+    traffic_mult = _traffic_multiplier_map(traffic_df)
 
-    # refurb set R from ZR costs/caps
-    R = sorted({r for (_, r) in lane_cap_ZR.keys()} | {r for (_, r) in C_ZR.keys()})
+    # Supply / Demand dicts
+    supply = {}
+    demand = {}
+    for _, row in supply_df.iterrows():
+        z = str(row[zone_col_s]).strip()
+        if z not in Z:
+            continue
+        for k in K:
+            supply[(z, k)] = float(row[k]) if _to_float(row[k]) is not None else 0.0
 
-    # ----------------- MODEL -----------------
-    m = pulp.LpProblem("DME_Recovery_Network", pulp.LpMinimize)
+    for _, row in demand_df.iterrows():
+        z = str(row[zone_col_d]).strip()
+        if z not in Z:
+            continue
+        for k in K:
+            # demand sheet might have slightly different columns; default to 0 if missing
+            if k in demand_df.columns:
+                demand[(z, k)] = float(row[k]) if _to_float(row[k]) is not None else 0.0
+            else:
+                demand[(z, k)] = 0.0
+
+    gamma = _gamma_map(gamma_df, K)
+
+    # ---- Costs: Z -> R from wide sheet like:
+    # Zone | R1_Dist | R2_Dist | R1_Level | R2_Level
+    zone_col_zr = _col(dist_zr_df, ["zone"])
+    if not zone_col_zr:
+        raise ValueError(f"DistClean_ZR must have Zone column. Columns={list(dist_zr_df.columns)}")
+    dist_zr_df[zone_col_zr] = dist_zr_df[zone_col_zr].astype(str).str.strip()
+
+    C_ZR = {}
+    for _, row in dist_zr_df.iterrows():
+        z = str(row[zone_col_zr]).strip()
+        if z not in Z:
+            continue
+        for r in R:
+            dist_col = _col(dist_zr_df, [f"{r}_Dist", f"{r}Dist", f"{r}_distance"])
+            lvl_col = _col(dist_zr_df, [f"{r}_Level", f"{r}Level", f"{r}_tier"])
+            if not dist_col:
+                continue
+            dist_val = _to_float(row[dist_col])
+            if dist_val is None:
+                continue
+            lvl_val = _norm(row[lvl_col]) if lvl_col and not pd.isna(row[lvl_col]) else "med"
+            m = traffic_mult.get(lvl_val, traffic_mult.get("med", 1.0))
+            C_ZR[(z, r)] = dist_val * float(m)
+
+    # ---- Costs: R -> W1 from 3-col sheet like:
+    # Refurb | Dist_to_W1 | Level
+    a = r_col_rw or _col(dist_rw_df, ["refurb", "r"])
+    dist_col_rw = _col(dist_rw_df, ["dist_to_w1", "distance_to_w1", "dist", "distance"])
+    lvl_col_rw = _col(dist_rw_df, ["level", "tier"])
+    if not a or not dist_col_rw:
+        raise ValueError(f"DistClean_RW must have refurb + distance columns. Columns={list(dist_rw_df.columns)}")
+
+    C_RW = {}
+    for _, row in dist_rw_df.iterrows():
+        rname = str(row[a]).strip()
+        if rname not in R:
+            continue
+        dist_val = _to_float(row[dist_col_rw])
+        if dist_val is None:
+            continue
+        lvl_val = _norm(row[lvl_col_rw]) if lvl_col_rw and not pd.isna(row[lvl_col_rw]) else "med"
+        m = traffic_mult.get(lvl_val, traffic_mult.get("med", 1.0))
+        C_RW[rname] = dist_val * float(m)
+
+    # ---- Costs: W1 -> Z (try similar formats)
+    zone_col_wz = _col(dist_wz_df, ["zone"])
+    if not zone_col_wz:
+        raise ValueError(f"DistClean_WZ must have Zone column. Columns={list(dist_wz_df.columns)}")
+    dist_wz_df[zone_col_wz] = dist_wz_df[zone_col_wz].astype(str).str.strip()
+
+    dist_col_wz = _col(dist_wz_df, ["dist_from_w1", "dist_to_zone", "dist", "distance", "w1_dist"])
+    lvl_col_wz = _col(dist_wz_df, ["level", "tier"])
+    if not dist_col_wz:
+        # fallback: maybe there is only one non-zone column that is numeric
+        for c in dist_wz_df.columns:
+            if c == zone_col_wz:
+                continue
+            # pick first column that has any numeric values
+            if pd.to_numeric(dist_wz_df[c], errors="coerce").notna().any():
+                dist_col_wz = c
+                break
+    if not dist_col_wz:
+        raise ValueError(f"DistClean_WZ needs a numeric distance column. Columns={list(dist_wz_df.columns)}")
+
+    C_WZ = {}
+    for _, row in dist_wz_df.iterrows():
+        z = str(row[zone_col_wz]).strip()
+        if z not in Z:
+            continue
+        dist_val = _to_float(row[dist_col_wz])
+        if dist_val is None:
+            continue
+        lvl_val = _norm(row[lvl_col_wz]) if lvl_col_wz and not pd.isna(row[lvl_col_wz]) else "med"
+        m = traffic_mult.get(lvl_val, traffic_mult.get("med", 1.0))
+        C_WZ[z] = dist_val * float(m)
+
+    # ---- Lane capacities ----
+    # LaneCap_ZR likely wide: Zone | R1 | R2 ... (or R1_Cap etc)
+    zone_col_capzr = _col(cap_zr_df, ["zone"])
+    if not zone_col_capzr:
+        raise ValueError(f"LaneCap_ZR must have Zone column. Columns={list(cap_zr_df.columns)}")
+    cap_zr_df[zone_col_capzr] = cap_zr_df[zone_col_capzr].astype(str).str.strip()
+
+    lane_cap_ZR = {}
+    for _, row in cap_zr_df.iterrows():
+        z = str(row[zone_col_capzr]).strip()
+        if z not in Z:
+            continue
+        for r in R:
+            ccap = _col(cap_zr_df, [f"{r}_Cap", f"{r}Cap", f"{r}", f"{r}_Capacity"])
+            if not ccap:
+                continue
+            v = _to_float(row[ccap])
+            if v is not None:
+                lane_cap_ZR[(z, r)] = float(v)
+
+    # LaneCap_Wz likely: Zone | Cap (or similar)
+    zone_col_capwz = _col(cap_wz_df, ["zone"])
+    if not zone_col_capwz:
+        raise ValueError(f"LaneCap_Wz must have Zone column. Columns={list(cap_wz_df.columns)}")
+    cap_wz_df[zone_col_capwz] = cap_wz_df[zone_col_capwz].astype(str).str.strip()
+
+    cap_col_wz = _col(cap_wz_df, ["cap", "capacity", "lane_cap", "max"])
+    if not cap_col_wz:
+        # fallback: first numeric col besides zone
+        for c in cap_wz_df.columns:
+            if c == zone_col_capwz:
+                continue
+            if pd.to_numeric(cap_wz_df[c], errors="coerce").notna().any():
+                cap_col_wz = c
+                break
+    if not cap_col_wz:
+        raise ValueError(f"LaneCap_Wz needs a numeric capacity column. Columns={list(cap_wz_df.columns)}")
+
+    lane_cap_WZ = {}
+    for _, row in cap_wz_df.iterrows():
+        z = str(row[zone_col_capwz]).strip()
+        if z not in Z:
+            continue
+        v = _to_float(row[cap_col_wz])
+        if v is not None:
+            lane_cap_WZ[z] = float(v)
+
+    # -----------------------------
+    # Build LP
+    # -----------------------------
+    model = pulp.LpProblem("DME_Recovery_Network", pulp.LpMinimize)
 
     x = {(z, r, k, t): pulp.LpVariable(f"x_{z}_{r}_{k}_{t}", lowBound=0)
          for z in Z for r in R for k in K for t in T}
@@ -208,85 +317,97 @@ def run_model(cost_mult_ZR=1.0, cost_mult_RW=1.0, cost_mult_WZ=1.0, cap_mult=1.0
     zDump = {(k, t): pulp.LpVariable(f"zDump_{k}_{t}", lowBound=0)
              for k in K for t in T}
 
-    # objective (use traffic multiplier per period)
-    m += (
+    # Objective
+    model += (
         pulp.lpSum(
-            cost_mult_ZR * traffic[t] * C_ZR.get((z, r), 0.0) * gamma[k] * x[(z, r, k, t)]
+            cost_mult_ZR * C_ZR.get((z, r), 0.0) * gamma[k] * x[(z, r, k, t)]
             for z in Z for r in R for k in K for t in T
         )
         + pulp.lpSum(
-            cost_mult_RW * traffic[t] * C_RW.get(r, 0.0) * gamma[k] * y[(r, k, t)]
+            cost_mult_RW * C_RW.get(r, 0.0) * gamma[k] * y[(r, k, t)]
             for r in R for k in K for t in T
         )
         + pulp.lpSum(
-            cost_mult_WZ * traffic[t] * C_WZ.get(z, 0.0) * gamma[k] * w[(z, k, t)]
+            cost_mult_WZ * C_WZ.get(z, 0.0) * gamma[k] * w[(z, k, t)]
             for z in Z for k in K for t in T
-        )
+        ),
+        "Total_Weekly_Transportation_Cost",
     )
 
-    # supply
+    # Constraints
     for z in Z:
         for k in K:
             for t in T:
-                m += pulp.lpSum(x[(z, r, k, t)] for r in R) <= supply[(z, k)]
+                model += (
+                    pulp.lpSum(x[(z, r, k, t)] for r in R) <= supply.get((z, k), 0.0),
+                    f"SupplyLimit_{z}_{k}_{t}",
+                )
 
-    # refurb balance
     for r in R:
         for k in K:
             for t in T:
-                m += pulp.lpSum(x[(z, r, k, t)] for z in Z) == y[(r, k, t)]
+                model += (
+                    pulp.lpSum(x[(z, r, k, t)] for z in Z) == y[(r, k, t)],
+                    f"RefurbBalance_{r}_{k}_{t}",
+                )
 
-    # warehouse balance
     for k in K:
         for t in T:
-            m += pulp.lpSum(y[(r, k, t)] for r in R) == pulp.lpSum(w[(z, k, t)] for z in Z) + zDump[(k, t)]
+            model += (
+                pulp.lpSum(y[(r, k, t)] for r in R)
+                == pulp.lpSum(w[(z, k, t)] for z in Z) + zDump[(k, t)],
+                f"WarehouseBalance_{k}_{t}",
+            )
 
-    # demand
     for z in Z:
         for k in K:
             for t in T:
-                m += w[(z, k, t)] >= demand[(z, k)]
+                model += (
+                    w[(z, k, t)] >= demand.get((z, k), 0.0),
+                    f"Demand_{z}_{k}_{t}",
+                )
 
-    # lane cap ZR
     for z in Z:
         for r in R:
-            cap = lane_cap_ZR.get((z, r), None)
-            if cap is None:
-                continue
             for t in T:
-                m += pulp.lpSum(gamma[k] * x[(z, r, k, t)] for k in K) <= cap_mult * cap
+                model += (
+                    pulp.lpSum(gamma[k] * x[(z, r, k, t)] for k in K)
+                    <= cap_mult * lane_cap_ZR.get((z, r), 1e18),
+                    f"LaneCap_ZR_{z}_{r}_{t}",
+                )
 
-    # lane cap WZ
     for z in Z:
-        cap = lane_cap_WZ.get(z, None)
-        if cap is None:
-            continue
         for t in T:
-            m += pulp.lpSum(gamma[k] * w[(z, k, t)] for k in K) <= cap_mult * cap
+            model += (
+                pulp.lpSum(gamma[k] * w[(z, k, t)] for k in K)
+                <= cap_mult * lane_cap_WZ.get(z, 1e18),
+                f"LaneCap_WZ_{z}_{t}",
+            )
 
+    # Solve
     solver = pulp.PULP_CBC_CMD(msg=False)
-    status = m.solve(solver)
+    result_status = model.solve(solver)
 
-    status_str = pulp.LpStatus[status]
-    obj_value = float(pulp.value(m.objective)) if pulp.value(m.objective) is not None else None
+    status_str = pulp.LpStatus[result_status]
+    obj_value = pulp.value(model.objective)
 
-    # basic outputs (period 1)
+    # Output tables (single time period)
     t0 = T[0]
 
     flows_ZR = pd.DataFrame([
-        {"Zone": z, "Refurb": r, "Type": k, "Flow_to_Refurb": float(pulp.value(x[(z, r, k, t0)]))}
+        {"Zone": z, "Refurb": r, "Type": k, "Flow_to_Refurb": pulp.value(x[(z, r, k, t0)])}
         for z in Z for r in R for k in K
         if pulp.value(x[(z, r, k, t0)]) and pulp.value(x[(z, r, k, t0)]) > 1e-6
     ])
 
     flows_RW = pd.DataFrame([
-        {"Refurb": r, "Type": k, "Flow_to_Warehouse": float(pulp.value(y[(r, k, t0)]))}
+        {"Refurb": r, "Type": k, "Flow_to_Warehouse": pulp.value(y[(r, k, t0)])}
         for r in R for k in K
         if pulp.value(y[(r, k, t0)]) and pulp.value(y[(r, k, t0)]) > 1e-6
     ])
 
     flows_WZ = pd.DataFrame([
-        {"Zone": z, "Type": k, "Flow_to_Zone": float(pulp.value(w[(z, k, t0)]))}
+        {"Zone": z, "Type": k, "Flow_to_Zone": pulp.value(w[(z, k, t0)])}
         for z in Z for k in K
         if pulp.value(w[(z, k, t0)]) and pulp.value(w[(z, k, t0)]) > 1e-6
     ])
