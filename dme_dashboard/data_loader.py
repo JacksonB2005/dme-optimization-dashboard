@@ -4,85 +4,198 @@ from pathlib import Path
 import pandas as pd
 
 
-def _find_excel_file(filename: str = "Operations Final X.xlsx") -> Path:
-    """
-    Look for the Excel file in common deploy locations:
-    - same folder as this file (dme_dashboard/)
-    - repo root
-    - current working directory
-    """
-    app_dir = Path(__file__).resolve().parent          # .../dme_dashboard
-    repo_dir = app_dir.parent                         # repo root
-    candidates = [
-        app_dir / filename,
-        repo_dir / filename,
-        Path.cwd() / filename,
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-
-    raise FileNotFoundError(
-        "Excel file not found. Tried:\n" + "\n".join(f" - {c}" for c in candidates)
-    )
+# -------------------------
+# Path to Excel file
+# -------------------------
+APP_DIR = Path(__file__).resolve().parent
+EXCEL_FILE = APP_DIR / "Operations Final X.xlsx"
 
 
-def _sheet_map(excel_path: Path) -> dict[str, str]:
-    """
-    Build a case-insensitive map of sheet names -> actual sheet name.
-    """
-    xl = pd.ExcelFile(excel_path, engine="openpyxl")
-    return {name.strip().lower(): name for name in xl.sheet_names}
+def normalize_name(s: str) -> str:
+    """Helper to match 'Wheelchair' vs 'Wheelchairs' etc."""
+    return str(s).strip().lower().replace(" ", "").rstrip("s")
 
 
-def _read_sheet(excel_path: Path, sheet_name: str) -> pd.DataFrame:
-    """
-    Read a sheet by exact name, with fallback to case-insensitive match.
-    """
-    smap = _sheet_map(excel_path)
-    key = sheet_name.strip().lower()
-    actual = smap.get(key)
-
-    if actual is None:
-        available = sorted(smap.values())
-        raise ValueError(
-            f"Worksheet named '{sheet_name}' not found.\n"
-            f"Available sheets: {available}"
+def _require_file_exists(path: Path) -> None:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Excel file not found: {path}\n"
+            f"Put 'Operations Final X.xlsx' in the SAME folder as data_loader.py "
+            f"(currently: {APP_DIR})."
         )
 
-    return pd.read_excel(excel_path, sheet_name=actual, engine="openpyxl")
+
+def _safe_rename_by_index(df: pd.DataFrame, mapping: dict[int, str]) -> pd.DataFrame:
+    cols = list(df.columns)
+    rename = {}
+    for idx, new_name in mapping.items():
+        if idx >= len(cols):
+            raise ValueError(f"Expected at least {idx+1} columns but got {len(cols)}. Columns={cols}")
+        rename[cols[idx]] = new_name
+    return df.rename(columns=rename)
 
 
-def load_data(excel_file: str | Path | None = None) -> dict[str, pd.DataFrame]:
+def load_data(excel_file: str | Path = EXCEL_FILE) -> dict:
     """
-    Load cleaned Excel sheets exactly as they exist in the workbook.
+    Returns a dict with keys that match what model.py expects:
+    Z, K, R, W, T,
+    supply, demand,
+    traffic_rate, gamma,
+    lane_cap_ZR, lane_cap_WZ,
+    C_ZR, C_RW, C_WZ
     """
-    excel_path = Path(excel_file) if excel_file is not None else _find_excel_file()
+    excel_file = Path(excel_file)
+    _require_file_exists(excel_file)
 
-    supply_df = _read_sheet(excel_path, "SupplyClean")
-    demand_df = _read_sheet(excel_path, "DemandClean")
+    # -------------------------
+    # 1) Supply & Demand
+    # -------------------------
+    supply_df = pd.read_excel(excel_file, sheet_name="SupplyClean")
+    demand_df = pd.read_excel(excel_file, sheet_name="DemandClean")
 
-    # Distance matrices
-    dist_zr = _read_sheet(excel_path, "DistClean_ZR")
-    dist_rw = _read_sheet(excel_path, "DistClean_RW")
-    dist_wz = _read_sheet(excel_path, "DistClean_WZ")
+    supply_df = supply_df.rename(columns={supply_df.columns[0]: "Zone"})
+    demand_df = demand_df.rename(columns={demand_df.columns[0]: "Zone"})
 
-    # Lane capacities (NOTE: your workbook tab shows LaneCap_Wz)
-    cap_zr = _read_sheet(excel_path, "LaneCap_ZR")
-    cap_wz = _read_sheet(excel_path, "LaneCap_Wz")
+    Z = [str(z).strip() for z in supply_df["Zone"].tolist()]
+    K = [str(c).strip() for c in supply_df.columns[1:].tolist()]
 
-    # Other parameters
-    traffic_df = _read_sheet(excel_path, "TrafficRatesClean")
-    gamma_df = _read_sheet(excel_path, "GammaClean")
+    R = ["R1", "R2"]
+    W = ["W1"]
+    T = [1]
+
+    supply = {(row["Zone"], k): float(row[k]) for _, row in supply_df.iterrows() for k in K}
+    demand = {(row["Zone"], k): float(row[k]) for _, row in demand_df.iterrows() for k in K}
+
+    # -------------------------
+    # 2) Distances + Levels
+    # -------------------------
+    # DistClean_ZR: Zone, R1_Dist, R2_Dist, R1_Level, R2_Level
+    distZR_df = pd.read_excel(excel_file, sheet_name="DistClean_ZR")
+    distZR_df = _safe_rename_by_index(
+        distZR_df,
+        {0: "Zone", 1: "R1_Dist", 2: "R2_Dist", 3: "R1_Level", 4: "R2_Level"},
+    )
+
+    dist_ZR = {}
+    level_ZR = {}
+    for _, row in distZR_df.iterrows():
+        z = str(row["Zone"]).strip()
+        dist_ZR[(z, "R1")] = float(row["R1_Dist"])
+        dist_ZR[(z, "R2")] = float(row["R2_Dist"])
+        level_ZR[(z, "R1")] = str(row["R1_Level"]).strip()
+        level_ZR[(z, "R2")] = str(row["R2_Level"]).strip()
+
+    # DistClean_RW: Refurb, Distance, Level  (LEVEL is text like Low/Med/High)
+    distRW_df = pd.read_excel(excel_file, sheet_name="DistClean_RW")
+    distRW_df = _safe_rename_by_index(distRW_df, {0: "Refurb", 1: "Distance", 2: "Level"})
+
+    dist_RW = {}
+    level_RW = {}
+    for _, row in distRW_df.iterrows():
+        r = str(row["Refurb"]).strip()  # should be R1/R2
+        dist_RW[r] = float(row["Distance"])
+        level_RW[r] = str(row["Level"]).strip()
+
+    # DistClean_WZ: Zone, Distance, Level
+    distWZ_df = pd.read_excel(excel_file, sheet_name="DistClean_WZ")
+    distWZ_df = _safe_rename_by_index(distWZ_df, {0: "Zone", 1: "Distance", 2: "Level"})
+
+    dist_WZ = {}
+    level_WZ = {}
+    for _, row in distWZ_df.iterrows():
+        z = str(row["Zone"]).strip()
+        dist_WZ[z] = float(row["Distance"])
+        level_WZ[z] = str(row["Level"]).strip()
+
+    # -------------------------
+    # 3) Traffic rates + gamma
+    # -------------------------
+    traffic_df = pd.read_excel(excel_file, sheet_name="TrafficRatesClean")
+    traffic_df = _safe_rename_by_index(traffic_df, {0: "Level", 1: "Rate"})
+
+    traffic_rate = {str(row["Level"]).strip(): float(row["Rate"]) for _, row in traffic_df.iterrows()}
+
+    gamma_df = pd.read_excel(excel_file, sheet_name="GammaClean")
+    gamma_df = _safe_rename_by_index(gamma_df, {0: "Type", 1: "Gamma"})
+
+    gamma_by_norm = {normalize_name(row["Type"]): float(row["Gamma"]) for _, row in gamma_df.iterrows()}
+    gamma = {}
+    for k in K:
+        nk = normalize_name(k)
+        if nk not in gamma_by_norm:
+            raise KeyError(f"Gamma not found for equipment type '{k}'")
+        gamma[k] = gamma_by_norm[nk]
+
+    # -------------------------
+    # 4) Lane capacities
+    # -------------------------
+    laneZR_df = pd.read_excel(excel_file, sheet_name="LaneCap_ZR")
+    laneZR_df = _safe_rename_by_index(laneZR_df, {0: "Zone", 1: "R1_Cap", 2: "R2_Cap"})
+
+    lane_cap_ZR = {}
+    for _, row in laneZR_df.iterrows():
+        z = str(row["Zone"]).strip()
+        lane_cap_ZR[(z, "R1")] = float(row["R1_Cap"])
+        lane_cap_ZR[(z, "R2")] = float(row["R2_Cap"])
+
+    laneWZ_df = pd.read_excel(excel_file, sheet_name="LaneCap_Wz")
+    laneWZ_df = _safe_rename_by_index(laneWZ_df, {0: "Zone", 1: "Cap_WZ"})
+
+    lane_cap_WZ = {str(row["Zone"]).strip(): float(row["Cap_WZ"]) for _, row in laneWZ_df.iterrows()}
+
+    # -------------------------
+    # 5) Cost coefficients = distance * traffic_rate(level)
+    # -------------------------
+    C_ZR = {}
+    for z in Z:
+        for r in R:
+            lvl = level_ZR[(z, r)]
+            if lvl not in traffic_rate:
+                raise KeyError(f"Traffic level '{lvl}' not found in TrafficRatesClean")
+            C_ZR[(z, r)] = dist_ZR[(z, r)] * traffic_rate[lvl]
+
+    C_RW = {}
+    for r in R:
+        # dist_RW keys should be 'R1','R2' — handle if sheet uses something else
+        key = r
+        if key not in dist_RW:
+            # try case-insensitive match
+            matches = [k for k in dist_RW.keys() if str(k).strip().lower() == r.lower()]
+            if matches:
+                key = matches[0]
+            else:
+                raise KeyError(f"DistClean_RW missing refurb row for '{r}'. Found keys: {list(dist_RW.keys())}")
+
+        lvl = level_RW[key]
+        if lvl not in traffic_rate:
+            raise KeyError(f"Traffic level '{lvl}' not found in TrafficRatesClean")
+        C_RW[r] = dist_RW[key] * traffic_rate[lvl]
+
+    C_WZ = {}
+    for z in Z:
+        lvl = level_WZ[z]
+        if lvl not in traffic_rate:
+            raise KeyError(f"Traffic level '{lvl}' not found in TrafficRatesClean")
+        C_WZ[z] = dist_WZ[z] * traffic_rate[lvl]
 
     return {
-        "supply": supply_df,
-        "demand": demand_df,
-        "dist_ZR": dist_zr,
-        "dist_RW": dist_rw,
-        "dist_WZ": dist_wz,
-        "cap_ZR": cap_zr,
-        "cap_WZ": cap_wz,
-        "traffic": traffic_df,
-        "gamma": gamma_df,
+        "Z": Z,
+        "K": K,
+        "R": R,
+        "W": W,
+        "T": T,
+        "supply": supply,
+        "demand": demand,
+        "traffic_rate": traffic_rate,
+        "gamma": gamma,
+        "lane_cap_ZR": lane_cap_ZR,
+        "lane_cap_WZ": lane_cap_WZ,
+        "C_ZR": C_ZR,
+        "C_RW": C_RW,
+        "C_WZ": C_WZ,
     }
+
+
+if __name__ == "__main__":
+    d = load_data()
+    print("Loaded OK:", len(d["Z"]), "zones,", len(d["K"]), "types")
