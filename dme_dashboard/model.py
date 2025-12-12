@@ -1,6 +1,8 @@
 import pulp
 import pandas as pd
 from data_loader import load_data
+print("MODEL VERSION: 2025-12-12-A")
+
 
 
 def run_model(
