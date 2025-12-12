@@ -394,54 +394,44 @@ def run_model(
     # Output tables (single time period)
     t0 = T[0]
 
+       # ---- 8) Flows (safe extraction) ----
+    t0 = T[0]
+
     flows_ZR = pd.DataFrame([
-        {"Zone": z, "Refurb": r, "Type": k, "Flow_to_Refurb": pulp.value(x[(z, r, k, t0)])}
+        {
+            "Zone": z,
+            "Refurb": r,
+            "Type": k,
+            "Flow_to_Refurb": pulp.value(x[(z, r, k, t0)])
+        }
         for z in Z for r in R for k in K
-        if pulp.value(x[(z, r, k, t0)]) and pulp.value(x[(z, r, k, t0)]) > 1e-6
+        if pulp.value(x[(z, r, k, t0)]) is not None
+        and pulp.value(x[(z, r, k, t0)]) > 1e-6
     ])
 
     flows_RW = pd.DataFrame([
-        {"Refurb": r, "Type": k, "Flow_to_Warehouse": pulp.value(y[(r, k, t0)])}
+        {
+            "Refurb": r,
+            "Type": k,
+            "Flow_to_Warehouse": pulp.value(y[(r, k, t0)])
+        }
         for r in R for k in K
-        if pulp.value(y[(r, k, t0)]) and pulp.value(y[(r, k, t0)]) > 1e-6
+        if pulp.value(y[(r, k, t0)]) is not None
+        and pulp.value(y[(r, k, t0)]) > 1e-6
     ])
 
     flows_WZ = pd.DataFrame([
-        {"Zone": z, "Type": k, "Flow_to_Zone": pulp.value(w[(z, k, t0)])}
+        {
+            "Zone": z,
+            "Type": k,
+            "Flow_to_Zone": pulp.value(w[(z, k, t0)])
+        }
         for z in Z for k in K
-        if pulp.value(w[(z, k, t0)]) and pulp.value(w[(z, k, t0)]) > 1e-6
+        if pulp.value(w[(z, k, t0)]) is not None
+        and pulp.value(w[(z, k, t0)]) > 1e-6
     ])
 
-    # ---- Cost breakdown ----
-    cost_ZR = sum(
-        cost_mult_ZR * C_ZR.get((z, r), 0.0) * gamma[k] * pulp.value(x[(z, r, k, t)])
-        for z in Z for r in R for k in K for t in T
-        if pulp.value(x[(z, r, k, t)]) is not None
-    )
-
-    cost_RW = sum(
-        cost_mult_RW * C_RW.get(r, 0.0) * gamma[k] * pulp.value(y[(r, k, t)])
-        for r in R for k in K for t in T
-        if pulp.value(y[(r, k, t)]) is not None
-    )
-
-    cost_WZ = sum(
-        cost_mult_WZ * C_WZ.get(z, 0.0) * gamma[k] * pulp.value(w[(z, k, t)])
-        for z in Z for k in K for t in T
-        if pulp.value(w[(z, k, t)]) is not None
-    )
-
-    cost_breakdown = {
-        "Zone_to_Refurb": float(cost_ZR),
-        "Refurb_to_Warehouse": float(cost_RW),
-        "Warehouse_to_Zone": float(cost_WZ),
-        "Total": float(cost_ZR + cost_RW + cost_WZ),
-    }
-
-
-
-
-       return {
+    return {
         "status": status_str,
         "objective": obj_value,
         "cost_breakdown": cost_breakdown,
